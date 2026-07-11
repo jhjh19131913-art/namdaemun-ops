@@ -120,6 +120,7 @@ const state = {
   tagDraftGroups: null,
   tagPendingMoves: [],
   tagSettingsDirty: false,
+  pendingTagChanges: {},
   migrationErrors: [],
   draggingTripLocation: "",
   tripLocationDragMoved: false,
@@ -660,6 +661,7 @@ function loadState() {
     state.tripLocations = mergeTripLocations(saved.tripLocations || getTripLocationsFromGroups(state.groups));
     state.migrationErrors = [];
     state.logs = normalizeStoredLogs(saved.logs, state.groups, state.migrationErrors);
+    state.pendingTagChanges = normalizePendingTagChanges(saved.pendingTagChanges);
     if (state.migrationErrors.length) {
       localStorage.setItem(TAG_MIGRATION_ERRORS_KEY, JSON.stringify(state.migrationErrors));
     }
@@ -954,6 +956,78 @@ function setTagState(group, tagId, isActive) {
   group.tagStates[tagId] = { isActive, updatedAt: new Date().toISOString() };
 }
 
+function normalizePendingTagChanges(changes) {
+  if (!changes || typeof changes !== "object" || Array.isArray(changes)) return {};
+  return Object.fromEntries(
+    Object.entries(changes).filter(([, tag]) => tag?.id && tag?.groupId && tag?.name),
+  );
+}
+
+function tagMap(groups) {
+  const map = new Map();
+  normalizeStoredGroups(groups).forEach((group) => {
+    group.tags.forEach((tag) => map.set(tag.id, { ...tag, groupId: group.id }));
+  });
+  return map;
+}
+
+function queueChangedTags(previousGroups, nextGroups) {
+  const before = tagMap(previousGroups);
+  const after = tagMap(nextGroups);
+  const now = new Date().toISOString();
+  after.forEach((tag, id) => {
+    const previous = before.get(id);
+    const changed =
+      !previous ||
+      previous.name !== tag.name ||
+      previous.groupId !== tag.groupId ||
+      previous.order !== tag.order ||
+      previous.isActive !== tag.isActive;
+    if (!changed) return;
+    state.pendingTagChanges[id] = { ...tag, updatedAt: now };
+    const group = findGroup(tag.groupId, nextGroups);
+    if (group) {
+      group.tagStates = normalizeTagStates(group.tagStates);
+      group.tagStates[id] = { isActive: tag.isActive !== false, updatedAt: now };
+    }
+  });
+}
+
+function groupsFromCloudTagRows(baseGroups, rows) {
+  const base = normalizeStoredGroups(baseGroups).map((group) => ({ ...group, tags: [], tagStates: {} }));
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    if (!row?.id || !row?.group_id || !row?.name) return;
+    let group = findGroup(row.group_id, base);
+    if (!group) {
+      group = { id: row.group_id, name: row.group_id, tags: [], tagStates: {} };
+      base.push(group);
+    }
+    const updatedAt = row.updated_at || "1970-01-01T00:00:00.000Z";
+    group.tags.push({
+      id: row.id,
+      name: row.name,
+      groupId: row.group_id,
+      order: Number(row.sort_order) || group.tags.length + 1,
+      isActive: row.is_active !== false,
+      updatedAt,
+    });
+    group.tagStates[row.id] = { isActive: row.is_active !== false, updatedAt };
+  });
+  return normalizeStoredGroups(base);
+}
+
+function tagToCloudRow(tag, userId) {
+  return {
+    user_id: userId,
+    id: tag.id,
+    group_id: tag.groupId,
+    name: tag.name,
+    sort_order: Number(tag.order) || 1,
+    is_active: tag.isActive !== false,
+    updated_at: tag.updatedAt || new Date().toISOString(),
+  };
+}
+
 function normalizeStoredLogs(savedLogs, groups, errors = []) {
   if (!Array.isArray(savedLogs)) return [];
   return savedLogs.map((log) => normalizeLogRecord(log, groups, errors)).filter(Boolean);
@@ -1048,6 +1122,7 @@ function persist(options = {}) {
       groups: decorateGroupsWithTripLocations(state.groups),
       tripLocations: state.tripLocations,
       logs: state.logs,
+      pendingTagChanges: state.pendingTagChanges,
       savedAt: new Date().toISOString(),
     }),
   );
@@ -1598,7 +1673,9 @@ function saveTagSettings() {
     TAG_SETTINGS_BACKUP_KEY,
     JSON.stringify({ backedUpAt: new Date().toISOString(), groups: state.groups, logs: state.logs }),
   );
+  const previousGroups = structuredClone(state.groups);
   state.groups = normalizeStoredGroups(state.tagDraftGroups);
+  queueChangedTags(previousGroups, state.groups);
   const moves = [...state.tagPendingMoves];
   state.logs = state.logs.map((log) => {
     const move = moves.find((item) => item.groupId === log.groupId && item.fromTagId === log.tagId);
@@ -2029,9 +2106,10 @@ async function syncCloud(options = {}) {
   state.cloud.isSyncing = true;
   renderCloudSettings();
   try {
-    const [settingsRows, rows] = await Promise.all([
+    const [settingsRows, rows, tagRows] = await Promise.all([
       cloudDataRequest("ops_settings?select=groups,updated_at&limit=1"),
       cloudDataRequest("ops_logs?select=*"),
+      cloudDataRequest("ops_tags?select=*&order=group_id.asc,sort_order.asc"),
     ]);
     const settings = settingsRows?.[0];
 
@@ -2043,7 +2121,8 @@ async function syncCloud(options = {}) {
       );
     }
 
-    state.groups = mergeGroupSets(state.groups, settings?.groups);
+    const legacyGroups = mergeGroupSets(state.groups, settings?.groups);
+    state.groups = tagRows?.length ? groupsFromCloudTagRows(legacyGroups, tagRows) : legacyGroups;
     state.tripLocations = mergeTripLocations([...state.tripLocations, ...getTripLocationsFromGroups(state.groups)]);
     state.logs = mergeLogsForSync(state.logs, (rows || []).map(cloudRowToLog));
     if (state.migrationErrors.length) {
@@ -2082,6 +2161,8 @@ async function pushCloudState(options = {}) {
     },
   });
 
+  await pushPendingTagChanges({ keepalive: Boolean(options.keepalive) });
+
   if (state.logs.length) {
     await cloudDataRequest("ops_logs?on_conflict=id", {
       method: "POST",
@@ -2093,6 +2174,22 @@ async function pushCloudState(options = {}) {
   state.cloud.lastSyncAt = now;
   renderCloudSettings();
   if (!options.silent) showToast("클라우드에 저장했습니다.");
+}
+
+async function pushPendingTagChanges(options = {}) {
+  const pending = Object.values(normalizePendingTagChanges(state.pendingTagChanges));
+  if (!pending.length || !state.cloud.user) return;
+  const pushed = new Map(pending.map((tag) => [tag.id, tag.updatedAt]));
+  await cloudDataRequest("ops_tags?on_conflict=user_id,id", {
+    method: "POST",
+    prefer: "resolution=merge-duplicates,return=minimal",
+    keepalive: Boolean(options.keepalive),
+    body: pending.map((tag) => tagToCloudRow(tag, state.cloud.user.id)),
+  });
+  pushed.forEach((updatedAt, id) => {
+    if (state.pendingTagChanges[id]?.updatedAt === updatedAt) delete state.pendingTagChanges[id];
+  });
+  persist({ skipCloud: true });
 }
 
 async function syncOrderBoardState() {
