@@ -740,11 +740,15 @@ function normalizeOrderHistoryEntry(entry) {
   const category = normalizeOrderCategory(entry.category || item.category);
   const deliveryStatus = normalizeOrderDeliveryStatus(entry.deliveryStatus || item.deliveryStatus);
   const deliveredAt = entry.deliveredAt || item.deliveredAt || "";
+  const deletedAt = entry.deletedAt || item.deletedAt || "";
+  const updatedAt = entry.updatedAt || item.updatedAt || deletedAt || entry.createdAt || "";
   return {
     ...entry,
     category,
     deliveryStatus,
     deliveredAt,
+    deletedAt,
+    updatedAt,
     status: entry.status || item.status || "발주완료",
     customer: entry.customer || item.customer || "",
     quantity: entry.quantity || item.quantity || "",
@@ -2120,6 +2124,9 @@ async function pushOrderBoardState(options = {}) {
   }
 
   if (state.orderHistory.length) {
+    const remoteHistoryRows = await cloudDataRequest("order_history?select=*");
+    state.orderHistory = mergeOrderHistory(state.orderHistory, (remoteHistoryRows || []).map(cloudRowToOrderHistory));
+    persistOrderBoard({ skipCloud: true });
     await cloudDataRequest("order_history?on_conflict=id", {
       method: "POST",
       prefer: "resolution=merge-duplicates,return=minimal",
@@ -2276,8 +2283,8 @@ function mergeOrderHistory(localHistory, remoteHistory) {
   [...localHistory, ...remoteHistory].map(normalizeOrderHistoryEntry).forEach((entry) => {
     if (!entry?.id) return;
     const current = byId.get(entry.id);
-    const entryDate = new Date(entry.createdAt || 0);
-    const currentDate = new Date(current?.createdAt || 0);
+    const entryDate = new Date(entry.updatedAt || entry.deletedAt || entry.createdAt || 0);
+    const currentDate = new Date(current?.updatedAt || current?.deletedAt || current?.createdAt || 0);
     if (!current || entryDate >= currentDate) {
       byId.set(entry.id, { ...current, ...entry, pageData: entry.pageData || current?.pageData });
     }
@@ -2319,6 +2326,8 @@ function orderHistoryToCloudRow(entry, userId) {
     status: item.status || normalized.status || "발주완료",
     memo: item.memo || normalized.memo || "",
     sourceLogId: item.sourceLogId || normalized.sourceLogId || "",
+    deletedAt: item.deletedAt || normalized.deletedAt || "",
+    updatedAt: item.updatedAt || normalized.updatedAt || normalized.createdAt || "",
   }));
   return {
     id: normalized.id,
@@ -3242,11 +3251,12 @@ async function copyShareText() {
 function renderOrderBoard() {
   ensureOrderElements();
   if (!els.orderImageCounts) return;
+  const activeHistory = state.orderHistory.filter((entry) => !entry.deletedAt);
   els.orderImageCounts.replaceChildren(
     countPill(`상품 ${state.orderProducts.length}`),
     countPill(`바구니 ${state.orderCart.length}`),
-    countPill(`텍스트 ${state.orderHistory.filter((entry) => entry.type === "text").length}`),
-    countPill(`이력 ${state.orderHistory.length}`),
+    countPill(`텍스트 ${activeHistory.filter((entry) => entry.type === "text").length}`),
+    countPill(`이력 ${activeHistory.length}`),
   );
   if (els.productSearchInput && document.activeElement !== els.productSearchInput) {
     els.productSearchInput.value = state.orderSearch;
@@ -3436,7 +3446,7 @@ function renderGeneratedOrderPages() {
 }
 
 function renderOrderHistory() {
-  if (!state.orderHistory.length) {
+  if (!state.orderHistory.some((entry) => !entry.deletedAt)) {
     state.selectedOrderHistoryIds.clear();
     els.orderHistoryList.replaceChildren(emptyText("저장된 발주 이력이 없습니다."));
     return;
@@ -3493,6 +3503,9 @@ function renderOrderHistory() {
         createOrderStatusSelect(entry),
         orderActionButton("공유", "plain-action", () => shareHistoryEntry(entry.id)),
       );
+      if (entry.type === "text") {
+        actions.append(orderActionButton("삭제", "danger-action compact", () => removeTextOrderHistory(entry.id)));
+      }
 
       row.append(checkbox);
       if (thumb) row.append(thumb);
@@ -3508,10 +3521,43 @@ function getFilteredOrderHistory() {
     .toLocaleLowerCase("ko-KR")
     .split(/\s+/)
     .filter(Boolean);
-  if (!tokens.length) return state.orderHistory;
-  return state.orderHistory.filter((entry) => {
+  const activeEntries = state.orderHistory.filter((entry) => !entry.deletedAt);
+  if (!tokens.length) return activeEntries;
+  return activeEntries.filter((entry) => {
     const haystack = orderHistorySearchText(entry).toLocaleLowerCase("ko-KR");
     return tokens.every((token) => haystack.includes(token));
+  });
+}
+
+function markOrderHistoryDeleted(entryId, deletedAt = new Date().toISOString()) {
+  let changed = false;
+  state.orderHistory = state.orderHistory.map((entry) => {
+    if (entry.id !== entryId || entry.type !== "text" || entry.deletedAt) return entry;
+    changed = true;
+    const items = Array.isArray(entry.items) && entry.items.length ? entry.items : [{}];
+    return {
+      ...entry,
+      deletedAt,
+      updatedAt: deletedAt,
+      items: items.map((item) => ({ ...item, deletedAt, updatedAt: deletedAt })),
+    };
+  });
+  return changed;
+}
+
+async function removeTextOrderHistory(entryId) {
+  const entry = state.orderHistory.find((item) => item.id === entryId && item.type === "text" && !item.deletedAt);
+  if (!entry) return;
+  const title = orderHistoryTitle(entry);
+  if (!confirm(`"${title}" 텍스트 발주를 삭제할까요?`)) return;
+
+  await runCloudTask(async () => {
+    if (!markOrderHistoryDeleted(entryId)) return;
+    state.selectedOrderHistoryIds.delete(entryId);
+    persistOrderBoard();
+    await pushOrderBoardState({ silent: true });
+    renderOrderBoard();
+    showToast("텍스트 발주를 삭제했습니다.");
   });
 }
 
