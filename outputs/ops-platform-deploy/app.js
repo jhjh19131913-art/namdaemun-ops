@@ -172,6 +172,9 @@ const state = {
 
 const els = {};
 const orderImageUrlCache = new Map();
+let appServiceWorkerRegistration = null;
+let appReloadPending = false;
+let appReloadTimer = null;
 
 document.addEventListener("DOMContentLoaded", () => {
   bindElements();
@@ -626,11 +629,17 @@ function bindEvents() {
 
   window.addEventListener("online", () => resumeCloudWork({ force: true }));
   window.addEventListener("offline", renderCloudSettings);
-  window.addEventListener("focus", () => resumeCloudWork({ force: true }));
+  window.addEventListener("focus", () => {
+    resumeCloudWork({ force: true });
+    checkForAppUpdate();
+  });
   window.addEventListener("pagehide", flushCloudPush);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) flushCloudPush();
-    else resumeCloudWork({ force: true });
+    else {
+      resumeCloudWork({ force: true });
+      checkForAppUpdate();
+    }
   });
 }
 
@@ -4491,8 +4500,46 @@ async function installApp() {
   els.installBtn.hidden = true;
 }
 
-function registerServiceWorker() {
+async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   if (!location.protocol.startsWith("http")) return;
-  navigator.serviceWorker.register("./sw.js").catch(() => {});
+  navigator.serviceWorker.addEventListener("controllerchange", requestSafeAppReload);
+  try {
+    appServiceWorkerRegistration = await navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" });
+    await appServiceWorkerRegistration.update();
+    setInterval(checkForAppUpdate, 5 * 60 * 1000);
+  } catch {
+    // The existing app remains usable offline when an update check fails.
+  }
+}
+
+function checkForAppUpdate() {
+  appServiceWorkerRegistration?.update().catch(() => {});
+}
+
+function hasUnsavedWorkForReload() {
+  return Boolean(
+    els.memoInput?.value.trim() ||
+      els.textOrderMemoInput?.value.trim() ||
+      state.tagSettingsDirty ||
+      state.cloud.isSyncing ||
+      state.cloud.hasPendingChanges,
+  );
+}
+
+function requestSafeAppReload() {
+  appReloadPending = true;
+  tryApplyAppUpdate();
+}
+
+function tryApplyAppUpdate() {
+  clearTimeout(appReloadTimer);
+  if (!appReloadPending) return;
+  if (hasUnsavedWorkForReload()) {
+    showToast("새 버전 준비 완료 · 저장 후 자동 적용됩니다.");
+    appReloadTimer = setTimeout(tryApplyAppUpdate, 1500);
+    return;
+  }
+  appReloadPending = false;
+  window.location.reload();
 }
