@@ -7,7 +7,7 @@
     <title>업무 운영 플랫폼</title>
     <link rel="manifest" href="./manifest.json" />
     <link rel="icon" href="./icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./styles.css?v=28" />
+    <link rel="stylesheet" href="./styles.css?v=29" />
   </head>
   <body>
     <div class="app-shell">
@@ -331,6 +331,11 @@
             <div>
               <p class="eyebrow">설정</p>
               <h2 id="settingsHeading">태그 관리</h2>
+              <p class="panel-copy" id="tagSettingsStatus">태그를 수정한 뒤 설정 저장을 눌러주세요.</p>
+            </div>
+            <div class="tag-settings-actions">
+              <button class="plain-action" id="cancelTagSettingsBtn" type="button">취소</button>
+              <button class="primary-action compact" id="saveTagSettingsBtn" type="button">설정 저장</button>
             </div>
           </div>
 
@@ -503,7 +508,7 @@
     <dialog class="modal" id="tagDeleteModal">
       <form method="dialog">
         <div class="modal-head">
-          <h3>태그 삭제</h3>
+          <h3>태그 비활성</h3>
           <button class="icon-button" value="cancel" type="submit" title="닫기">×</button>
         </div>
         <p class="modal-copy" id="tagDeleteSummary">이 태그를 삭제할까요?</p>
@@ -514,12 +519,12 @@
         <p class="modal-note" id="tagDeleteNote"></p>
         <div class="modal-actions">
           <button class="plain-action" value="cancel" type="submit">취소</button>
-          <button class="plain-action" id="deleteTagKeepBtn" value="default" type="button">태그만 삭제</button>
-          <button class="danger-action compact" id="deleteTagMoveBtn" value="default" type="button">이동 후 삭제</button>
+          <button class="plain-action" id="deleteTagKeepBtn" value="default" type="button">연결 유지 후 비활성</button>
+          <button class="danger-action compact" id="deleteTagMoveBtn" value="default" type="button">이동 후 비활성</button>
         </div>
       </form>
     </dialog>
 
-    <script src="./app.js?v=44" defer></script>
+    <script src="./app.js?v=45" defer></script>
   </body>
 </html>
