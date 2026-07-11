@@ -143,6 +143,43 @@ button:disabled {
   flex: 1 1 130px;
 }
 
+.sync-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d8ded6;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #405046;
+  font-size: 0.78rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.sync-pill[data-status="saved"],
+.sync-pill[data-status="ready"] {
+  border-color: #b9d8c8;
+  background: #edf8f2;
+  color: #176148;
+}
+
+.sync-pill[data-status="syncing"],
+.sync-pill[data-status="pending"] {
+  border-color: #f0d78c;
+  background: #fff8df;
+  color: #7a5a08;
+}
+
+.sync-pill[data-status="error"],
+.sync-pill[data-status="offline"],
+.sync-pill[data-status="signed-out"] {
+  border-color: #efb6aa;
+  background: #fff0ed;
+  color: #9a2e1d;
+}
+
 .icon-button,
 .plain-action,
 .primary-action,
