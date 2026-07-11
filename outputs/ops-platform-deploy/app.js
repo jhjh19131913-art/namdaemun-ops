@@ -873,6 +873,7 @@ function normalizeStoredGroups(savedGroups) {
   const normalized = incoming.map((group) => {
     const groupId = canonicalGroupId(group);
     const defaultGroup = DEFAULT_GROUPS.find((item) => item.id === groupId);
+    const tagStates = normalizeTagStates(group.tagStates);
     const sourceTags = Array.isArray(group.tags) && group.tags.length ? group.tags : defaultGroup?.tags || [];
     const seenIds = new Set();
     const seenNames = new Set();
@@ -887,11 +888,19 @@ function normalizeStoredGroups(savedGroups) {
       })
       .sort((a, b) => a.order - b.order)
       .map((tag, index) => ({ ...tag, order: index + 1 }));
+    tags.forEach((tag) => {
+      const savedState = tagStates[tag.id];
+      if (savedState) tag.isActive = savedState.isActive !== false;
+      else if (tag.isActive === false) {
+        tagStates[tag.id] = { isActive: false, updatedAt: group.updatedAt || "1970-01-01T00:00:00.000Z" };
+      }
+    });
     return {
       ...group,
       id: groupId,
       name: defaultGroup?.name || String(group.name || groupId),
       tags: tags.length ? tags : structuredClone(defaultGroup?.tags || []),
+      tagStates,
     };
   });
 
@@ -899,6 +908,37 @@ function normalizeStoredGroups(savedGroups) {
     if (!normalized.some((group) => group.id === defaultGroup.id)) normalized.push(structuredClone(defaultGroup));
   });
   return normalized;
+}
+
+function normalizeTagStates(states) {
+  if (!states || typeof states !== "object" || Array.isArray(states)) return {};
+  return Object.fromEntries(
+    Object.entries(states)
+      .filter(([tagId, value]) => tagId && value && typeof value === "object")
+      .map(([tagId, value]) => [
+        tagId,
+        {
+          isActive: value.isActive !== false,
+          updatedAt: value.updatedAt || "1970-01-01T00:00:00.000Z",
+        },
+      ]),
+  );
+}
+
+function mergeTagStates(...stateMaps) {
+  const merged = {};
+  stateMaps.forEach((states) => {
+    Object.entries(normalizeTagStates(states)).forEach(([tagId, value]) => {
+      const current = merged[tagId];
+      if (!current || new Date(value.updatedAt) >= new Date(current.updatedAt)) merged[tagId] = value;
+    });
+  });
+  return merged;
+}
+
+function setTagState(group, tagId, isActive) {
+  group.tagStates = normalizeTagStates(group.tagStates);
+  group.tagStates[tagId] = { isActive, updatedAt: new Date().toISOString() };
 }
 
 function normalizeStoredLogs(savedLogs, groups, errors = []) {
@@ -2147,8 +2187,15 @@ async function parseCloudResponse(response) {
 }
 
 function mergeGroupSets(localGroups, remoteGroups) {
-  const source = Array.isArray(remoteGroups) && remoteGroups.length ? remoteGroups : localGroups;
-  return normalizeStoredGroups(source);
+  const local = normalizeStoredGroups(localGroups);
+  const remote = normalizeStoredGroups(Array.isArray(remoteGroups) && remoteGroups.length ? remoteGroups : localGroups);
+  const localById = new Map(local.map((group) => [group.id, group]));
+  return normalizeStoredGroups(
+    remote.map((group) => ({
+      ...group,
+      tagStates: mergeTagStates(localById.get(group.id)?.tagStates, group.tagStates),
+    })),
+  );
 }
 
 function mergeLogsForSync(localLogs, remoteLogs) {
@@ -2684,6 +2731,7 @@ function deletePendingTag(options = {}) {
   }
 
   tag.isActive = false;
+  setTagState(group, tag.id, false);
   state.pendingTagDelete = null;
   markTagSettingsDirty();
   els.tagDeleteModal.close();
@@ -2704,6 +2752,7 @@ function restoreTag(groupId, tagId) {
     return;
   }
   tag.isActive = true;
+  setTagState(group, tag.id, true);
   tag.order = orderedTags(group).length + 1;
   state.tagPendingMoves = state.tagPendingMoves.filter(
     (move) => !(move.groupId === group.id && move.fromTagId === tag.id),
