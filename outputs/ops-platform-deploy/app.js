@@ -7,6 +7,8 @@ const DEFAULT_CLOUD_URL = "https://qslckhefgueflmsxawxz.supabase.co";
 const DEFAULT_CLOUD_ANON_KEY = "sb_publishable_CATcL7oVdh4cmJhOxMISFA_Bm65K5ki";
 const AUTO_SYNC_INTERVAL_MS = 45000;
 const CLOUD_PUSH_DELAY_MS = 350;
+const CLOUD_RETRY_DELAY_MS = 8000;
+const CLOUD_RETRY_MAX_DELAY_MS = 60000;
 const ORDER_IMAGE_BUCKET = "order-images";
 const ORDER_IMAGE_MAX_SIZE = 1280;
 const ORDER_IMAGE_QUALITY = 0.82;
@@ -107,6 +109,12 @@ const state = {
     lastSyncAt: null,
     pushTimer: null,
     autoSyncTimer: null,
+    retryTimer: null,
+    retryDelayMs: CLOUD_RETRY_DELAY_MS,
+    hasPendingChanges: false,
+    pendingSince: null,
+    lastErrorAt: null,
+    lastErrorMessage: "",
   },
 };
 
@@ -165,6 +173,7 @@ function bindElements() {
     authPasswordInput: document.querySelector("#authPasswordInput"),
     authLoginBtn: document.querySelector("#authLoginBtn"),
     authSignupBtn: document.querySelector("#authSignupBtn"),
+    syncPill: document.querySelector("#syncPill"),
     cloudStatus: document.querySelector("#cloudStatus"),
     cloudUrlInput: document.querySelector("#cloudUrlInput"),
     cloudAnonKeyInput: document.querySelector("#cloudAnonKeyInput"),
@@ -557,12 +566,13 @@ function bindEvents() {
     els.installBtn.hidden = false;
   });
 
-  window.addEventListener("online", () => runAutoSync({ force: true }));
-  window.addEventListener("focus", () => runAutoSync({ force: true }));
+  window.addEventListener("online", () => resumeCloudWork({ force: true }));
+  window.addEventListener("offline", renderCloudSettings);
+  window.addEventListener("focus", () => resumeCloudWork({ force: true }));
   window.addEventListener("pagehide", flushCloudPush);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) flushCloudPush();
-    else runAutoSync({ force: true });
+    else resumeCloudWork({ force: true });
   });
 }
 
@@ -596,6 +606,10 @@ function loadCloudConfig() {
     state.cloud.refreshToken = saved.refreshToken || "";
     state.cloud.expiresAt = saved.expiresAt || 0;
     state.cloud.lastSyncAt = saved.lastSyncAt || null;
+    state.cloud.hasPendingChanges = Boolean(saved.hasPendingChanges);
+    state.cloud.pendingSince = saved.pendingSince || null;
+    state.cloud.lastErrorAt = saved.lastErrorAt || null;
+    state.cloud.lastErrorMessage = saved.lastErrorMessage || "";
   } catch {
     applyDefaultCloudConfig();
   }
@@ -695,6 +709,11 @@ function applyDefaultCloudConfig() {
   state.cloud.refreshToken = "";
   state.cloud.expiresAt = 0;
   state.cloud.lastSyncAt = null;
+  state.cloud.hasPendingChanges = false;
+  state.cloud.pendingSince = null;
+  state.cloud.lastErrorAt = null;
+  state.cloud.lastErrorMessage = "";
+  state.cloud.retryDelayMs = CLOUD_RETRY_DELAY_MS;
 }
 
 function saveCloudConfig() {
@@ -712,6 +731,10 @@ function saveCloudConfig() {
       refreshToken: state.cloud.refreshToken,
       expiresAt: state.cloud.expiresAt,
       lastSyncAt: state.cloud.lastSyncAt,
+      hasPendingChanges: Boolean(state.cloud.hasPendingChanges),
+      pendingSince: state.cloud.pendingSince,
+      lastErrorAt: state.cloud.lastErrorAt,
+      lastErrorMessage: state.cloud.lastErrorMessage,
       savedAt: new Date().toISOString(),
     }),
   );
@@ -1322,6 +1345,7 @@ function renderTripLocationSettings() {
 function renderCloudSettings() {
   if (!els.cloudStatus) return;
   renderAuthGate();
+  renderSyncState();
   els.cloudUrlInput.value = state.cloud.url;
   els.cloudAnonKeyInput.value = state.cloud.anonKey;
   if (document.activeElement !== els.cloudEmailInput) {
@@ -1340,6 +1364,9 @@ function renderCloudSettings() {
   }
   if (state.cloud.lastSyncAt) parts.push(`마지막 동기화: ${formatDate(state.cloud.lastSyncAt)}`);
   if (state.cloud.isSyncing) parts.push("동기화 중...");
+  if (!navigator.onLine) parts.push("인터넷 연결 대기 중.");
+  if (state.cloud.hasPendingChanges) parts.push("저장 대기 중. 연결되면 자동으로 다시 저장합니다.");
+  if (state.cloud.lastErrorMessage) parts.push(`마지막 저장 실패: ${state.cloud.lastErrorMessage}`);
   els.cloudStatus.textContent = parts.join(" ");
 
   els.cloudSyncBtn.disabled =
@@ -1347,6 +1374,24 @@ function renderCloudSettings() {
   els.cloudLoginBtn.disabled = state.cloud.isSyncing;
   els.cloudSignupBtn.disabled = state.cloud.isSyncing;
   els.cloudLogoutBtn.disabled = state.cloud.isSyncing || !state.cloud.user;
+}
+
+function renderSyncState() {
+  if (!els.syncPill) return;
+  const status = syncStatusInfo();
+  els.syncPill.textContent = status.label;
+  els.syncPill.dataset.status = status.status;
+  els.syncPill.hidden = false;
+}
+
+function syncStatusInfo() {
+  if (!navigator.onLine) return { status: "offline", label: "오프라인" };
+  if (!state.cloud.enabled || !isCloudSignedIn()) return { status: "signed-out", label: "로그인 필요" };
+  if (state.cloud.isSyncing) return { status: "syncing", label: "저장 중" };
+  if (state.cloud.lastErrorMessage) return { status: "error", label: "저장 확인" };
+  if (state.cloud.hasPendingChanges) return { status: "pending", label: "저장 대기" };
+  if (state.cloud.lastSyncAt) return { status: "saved", label: "저장 완료" };
+  return { status: "ready", label: "연결됨" };
 }
 
 function saveCloudConfigFromForm() {
@@ -1392,7 +1437,10 @@ async function initializeCloudSession() {
     await ensureCloudAccess();
     renderCloudSettings();
     if (state.cloud.user) {
-      await syncCloud({ silent: true });
+      if (state.cloud.hasPendingChanges) {
+        await pushPendingCloudState({ silent: true, force: true }).catch(() => {});
+      }
+      if (!state.cloud.hasPendingChanges) await syncCloud({ silent: true });
       startAutoSync();
     }
   } catch {
@@ -1521,21 +1569,118 @@ function stopAutoSync() {
 function runAutoSync(options = {}) {
   if (!state.cloud.enabled || !isCloudSignedIn() || state.cloud.isSyncing || !navigator.onLine) return;
   if (document.hidden && !options.force) return;
+  if (state.cloud.hasPendingChanges) {
+    pushPendingCloudState({ silent: true }).catch(() => {});
+    return;
+  }
   syncCloud({ silent: true }).catch(() => {});
 }
 
-function scheduleCloudPush() {
-  if (!state.cloud.enabled || !state.cloud.user || state.cloud.isSyncing) return;
+function resumeCloudWork(options = {}) {
+  renderCloudSettings();
+  if (!state.cloud.enabled || !isCloudSignedIn()) return;
+  if (state.cloud.hasPendingChanges) {
+    scheduleCloudPush(0);
+    return;
+  }
+  runAutoSync(options);
+}
+
+function scheduleCloudPush(delay = CLOUD_PUSH_DELAY_MS) {
+  if (!state.cloud.enabled || !state.cloud.user) return;
+  markCloudChangeQueued();
   clearTimeout(state.cloud.pushTimer);
   state.cloud.pushTimer = setTimeout(() => {
-    Promise.all([pushCloudState({ silent: true }), pushOrderBoardState({ silent: true })]).catch(() => {});
-  }, CLOUD_PUSH_DELAY_MS);
+    pushPendingCloudState({ silent: true }).catch(() => {});
+  }, delay);
 }
 
 function flushCloudPush() {
   if (!state.cloud.enabled || !isCloudSignedIn() || state.cloud.isSyncing) return;
   clearTimeout(state.cloud.pushTimer);
-  Promise.all([pushCloudState({ silent: true, keepalive: true })]).catch(() => {});
+  if (state.cloud.hasPendingChanges) {
+    pushPendingCloudState({ silent: true, keepalive: true }).catch(() => {});
+  }
+}
+
+function markCloudChangeQueued() {
+  if (!state.cloud.enabled || !state.cloud.user) return;
+  state.cloud.hasPendingChanges = true;
+  state.cloud.pendingSince ||= new Date().toISOString();
+  state.cloud.lastErrorMessage = "";
+  state.cloud.lastErrorAt = null;
+  saveCloudConfig();
+  renderCloudSettings();
+}
+
+function markCloudPushSucceeded() {
+  state.cloud.hasPendingChanges = false;
+  state.cloud.pendingSince = null;
+  state.cloud.lastErrorMessage = "";
+  state.cloud.lastErrorAt = null;
+  state.cloud.retryDelayMs = CLOUD_RETRY_DELAY_MS;
+  clearTimeout(state.cloud.retryTimer);
+  state.cloud.retryTimer = null;
+  saveCloudConfig();
+  renderCloudSettings();
+}
+
+function markCloudPushFailed(error) {
+  state.cloud.hasPendingChanges = true;
+  state.cloud.pendingSince ||= new Date().toISOString();
+  state.cloud.lastErrorAt = new Date().toISOString();
+  state.cloud.lastErrorMessage = readableCloudError(error);
+  saveCloudConfig();
+  renderCloudSettings();
+  scheduleCloudRetry();
+}
+
+function scheduleCloudRetry() {
+  if (!state.cloud.enabled || !isCloudSignedIn()) return;
+  clearTimeout(state.cloud.retryTimer);
+  const delay = state.cloud.retryDelayMs || CLOUD_RETRY_DELAY_MS;
+  state.cloud.retryTimer = setTimeout(() => {
+    pushPendingCloudState({ silent: true }).catch(() => {});
+  }, delay);
+  state.cloud.retryDelayMs = Math.min(delay * 2, CLOUD_RETRY_MAX_DELAY_MS);
+}
+
+function readableCloudError(error) {
+  if (!navigator.onLine) return "인터넷 연결 대기 중";
+  const message = String(error?.message || error || "").trim();
+  if (!message) return "자동 저장 재시도 중";
+  return message.length > 80 ? `${message.slice(0, 80)}...` : message;
+}
+
+async function pushPendingCloudState(options = {}) {
+  if (!state.cloud.enabled || !isCloudSignedIn()) return;
+  if (state.cloud.isSyncing && !options.force) {
+    scheduleCloudPush(Math.max(CLOUD_PUSH_DELAY_MS, 1000));
+    return;
+  }
+  if (!navigator.onLine) {
+    markCloudPushFailed(new Error("인터넷 연결 대기 중"));
+    return;
+  }
+  clearTimeout(state.cloud.pushTimer);
+  state.cloud.isSyncing = true;
+  renderCloudSettings();
+  try {
+    await Promise.all([
+      pushCloudState({ silent: true, keepalive: Boolean(options.keepalive) }),
+      pushOrderBoardState({ silent: true, keepalive: Boolean(options.keepalive) }),
+    ]);
+    state.cloud.lastSyncAt = new Date().toISOString();
+    markCloudPushSucceeded();
+    if (!options.silent) showToast("클라우드에 저장했습니다.");
+  } catch (error) {
+    markCloudPushFailed(error);
+    if (!options.silent) showToast("저장에 실패했습니다. 자동으로 다시 시도합니다.");
+    throw error;
+  } finally {
+    state.cloud.isSyncing = false;
+    renderCloudSettings();
+  }
 }
 
 async function syncCloud(options = {}) {
@@ -1563,6 +1708,7 @@ async function syncCloud(options = {}) {
     render();
     await pushCloudState({ silent: true });
     await pushOrderBoardState({ silent: true });
+    markCloudPushSucceeded();
     if (options.showDone) showToast("클라우드 동기화가 끝났습니다.");
   } catch (error) {
     if (!options.silent) showToast(error.message || "클라우드 동기화에 실패했습니다.");
@@ -1619,6 +1765,7 @@ async function pushOrderBoardState(options = {}) {
   await cloudDataRequest("order_image_settings?on_conflict=user_id", {
     method: "POST",
     prefer: "resolution=merge-duplicates,return=minimal",
+    keepalive: Boolean(options.keepalive),
     body: {
       user_id: state.cloud.user.id,
       fields: state.orderFields,
@@ -1630,6 +1777,7 @@ async function pushOrderBoardState(options = {}) {
     await cloudDataRequest("order_products?on_conflict=id", {
       method: "POST",
       prefer: "resolution=merge-duplicates,return=minimal",
+      keepalive: Boolean(options.keepalive),
       body: state.orderProducts.map((product) => orderProductToCloudRow(product, state.cloud.user.id)),
     });
   }
@@ -1638,6 +1786,7 @@ async function pushOrderBoardState(options = {}) {
     await cloudDataRequest("order_history?on_conflict=id", {
       method: "POST",
       prefer: "resolution=merge-duplicates,return=minimal",
+      keepalive: Boolean(options.keepalive),
       body: state.orderHistory.map((entry) => orderHistoryToCloudRow(entry, state.cloud.user.id)),
     });
   }
