@@ -1,9 +1,9 @@
-const CACHE_NAME = "ops-platform-v46";
+const CACHE_NAME = "ops-platform-v47";
 const ASSETS = [
   "./",
   "./index.html",
-  "./styles.css?v=27",
-  "./app.js?v=43",
+  "./styles.css?v=28",
+  "./app.js?v=44",
   "./manifest.json",
   "./icon.svg",
 ];
