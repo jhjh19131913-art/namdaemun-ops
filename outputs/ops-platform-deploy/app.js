@@ -994,15 +994,27 @@ function queueChangedTags(previousGroups, nextGroups) {
 }
 
 function groupsFromCloudTagRows(baseGroups, rows) {
-  const base = normalizeStoredGroups(baseGroups).map((group) => ({ ...group, tags: [], tagStates: {} }));
+  const base = normalizeStoredGroups(baseGroups);
   (Array.isArray(rows) ? rows : []).forEach((row) => {
     if (!row?.id || !row?.group_id || !row?.name) return;
+    const updatedAt = row.updated_at || "1970-01-01T00:00:00.000Z";
+    const currentGroup = base.find((group) => findTag(group, row.id, { includeInactive: true }));
+    const currentState = normalizeTagStates(currentGroup?.tagStates)[row.id];
+    if (currentState && new Date(currentState.updatedAt) > new Date(updatedAt)) return;
+
+    if (currentGroup) {
+      currentGroup.tags = currentGroup.tags.filter((tag) => tag.id !== row.id);
+      currentGroup.tagStates = normalizeTagStates(currentGroup.tagStates);
+      delete currentGroup.tagStates[row.id];
+    }
+
     let group = findGroup(row.group_id, base);
     if (!group) {
       group = { id: row.group_id, name: row.group_id, tags: [], tagStates: {} };
       base.push(group);
     }
-    const updatedAt = row.updated_at || "1970-01-01T00:00:00.000Z";
+    group.tags = group.tags.filter((tag) => tag.id !== row.id);
+    group.tagStates = normalizeTagStates(group.tagStates);
     group.tags.push({
       id: row.id,
       name: row.name,
